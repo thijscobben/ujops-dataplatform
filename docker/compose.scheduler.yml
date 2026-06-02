@@ -1,3 +1,764 @@
+## Me
+OK python src/run_scraper.py now works.
+Let's convert this, into a script that works with a docker-up postgres database, and schedule it to run daily on a specified set of keywords.
+
+## AI Assistant
+I'll help you convert this into a Docker-based solution with PostgreSQL integration and daily scheduling. Let me first explore your project structure to understand the current setup better.Great! Let me explore your project structure to understand the current setup better.Perfect! Let me create a comprehensive solution for you. I'll build:
+1. **Docker Compose setup** for PostgreSQL
+2. **Enhanced `daily_scraper_job.py`** with database integration
+3. **Scheduler script** using APScheduler for daily runs
+4. **Environment configuration**
+
+Let me first check your current structure:Perfect! I can help you convert the script to work with Docker Postgres and add daily scheduling. Here's a comprehensive solution:
+## 1. Update Docker Compose for PostgreSQL
+First, ensure your `docker/compose.yml` has a PostgreSQL service:
+``` yaml
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: jobanalyzer-postgres
+    environment:
+      POSTGRES_USER: <your_db_user>
+      POSTGRES_PASSWORD: <your_db_password>
+      POSTGRES_DB: jobanalyzer
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U <your_db_user>"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+```
+## 2. Create Database Module
+Create `src/database.py`:
+``` python
+import os
+import logging
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+from contextlib import contextmanager
+
+logger = logging.getLogger(__name__)
+
+
+def get_db_connection_string():
+    """Get PostgreSQL connection string from environment or defaults"""
+    db_user = os.getenv("DB_USER", "<your_db_user>")
+    db_password = os.getenv("DB_PASSWORD", "<your_db_password>")
+    db_host = os.getenv("DB_HOST", "localhost")
+    db_port = os.getenv("DB_PORT", "5432")
+    db_name = os.getenv("DB_NAME", "jobanalyzer")
+    
+    return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
+
+def init_db():
+    """Initialize database connection and create tables if needed"""
+    connection_string = get_db_connection_string()
+    engine = create_engine(connection_string, echo=False)
+    
+    # Create tables if they don't exist
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE SCHEMA IF NOT EXISTS raw;
+            CREATE SCHEMA IF NOT EXISTS staging;
+            CREATE SCHEMA IF NOT EXISTS warehouse;
+        """))
+        
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS raw.job_listings (
+                id SERIAL PRIMARY KEY,
+                title VARCHAR(255),
+                company VARCHAR(255),
+                location VARCHAR(255),
+                url TEXT,
+                description TEXT,
+                job_board VARCHAR(50),
+                scrape_keyword VARCHAR(100),
+                scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_job_listings_scraped_at 
+                ON raw.job_listings(scraped_at);
+            CREATE INDEX IF NOT EXISTS idx_job_listings_job_board 
+                ON raw.job_listings(job_board);
+        """))
+        
+        conn.commit()
+    
+    logger.info("Database initialized successfully")
+    return engine
+
+
+@contextmanager
+def get_session():
+    """Context manager for database sessions"""
+    engine = create_engine(get_db_connection_string())
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    try:
+        yield session
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Database session error: {e}")
+        raise
+    finally:
+        session.close()
+```
+## 3. Update Daily Scraper Job
+``` python
+import logging
+from datetime import datetime
+import pandas as pd
+from pathlib import Path
+from sqlalchemy import text
+import json
+
+from src.scrapers import LinkedInScraper, ScraperConfig, JobBoard
+from src.database import get_session, init_db
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+
+class DailyScraperJob:
+    """
+    Daily job to scrape job boards and load to PostgreSQL data warehouse.
+    """
+    
+    def __init__(self, db_enabled: bool = True, data_dir: str = "data/raw", keywords: list = None):
+        self.db_enabled = db_enabled
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.config = ScraperConfig()
+        self.keywords = keywords or self.config.KEYWORDS
+        self.run_timestamp = datetime.utcnow().isoformat()
+        
+        if self.db_enabled:
+            init_db()
+    
+    def run(self):
+        """Execute daily scraping job"""
+        logger.info("=" * 60)
+        logger.info(f"Starting daily scraping job: {self.run_timestamp}")
+        logger.info(f"Keywords: {self.keywords}")
+        logger.info("=" * 60)
+        
+        all_jobs = []
+        
+        # LinkedIn
+        try:
+            logger.info("\n[1/1] Scraping LinkedIn...")
+            linkedin = LinkedInScraper(self.config.RATE_LIMITS[JobBoard.LINKEDIN.value])
+            linkedin_jobs = linkedin.scrape_batch(self.keywords, self.config.LOCATION)
+            all_jobs.extend(linkedin_jobs)
+            logger.info(f"✓ LinkedIn: {len(linkedin_jobs)} jobs")
+        except Exception as e:
+            logger.error(f"✗ LinkedIn scraping failed: {e}")
+        
+        if not all_jobs:
+            logger.warning("No jobs scraped!")
+            return None
+        
+        # Save to raw layer
+        df = pd.DataFrame(all_jobs)
+        output_file = self._save_raw_data(df)
+        logger.info(f"\n✓ Saved {len(df)} jobs to {output_file}")
+        
+        # Load to database if enabled
+        if self.db_enabled:
+            try:
+                self._load_to_database(df)
+                logger.info(f"✓ Loaded {len(df)} jobs to PostgreSQL")
+            except Exception as e:
+                logger.error(f"✗ Database load failed: {e}")
+        
+        logger.info(f"\n✓ Job completed successfully")
+        return output_file
+    
+    def _save_raw_data(self, df: pd.DataFrame) -> str:
+        """Save raw scraped data as CSV"""
+        date_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"raw_job_listings_{date_str}.csv"
+        filepath = self.data_dir / filename
+        
+        df.to_csv(filepath, index=False)
+        return str(filepath)
+    
+    def _load_to_database(self, df: pd.DataFrame):
+        """Load data to PostgreSQL raw schema"""
+        with get_session() as session:
+            for _, row in df.iterrows():
+                insert_sql = text("""
+                    INSERT INTO raw.job_listings 
+                    (title, company, location, url, description, job_board, scrape_keyword)
+                    VALUES (:title, :company, :location, :url, :description, :job_board, :keyword)
+                """)
+                
+                session.execute(insert_sql, {
+                    'title': row.get('title'),
+                    'company': row.get('company'),
+                    'location': row.get('location'),
+                    'url': row.get('url'),
+                    'description': row.get('description'),
+                    'job_board': 'linkedin',
+                    'keyword': row.get('search_term', 'unknown')
+                })
+            
+            session.commit()
+
+
+if __name__ == "__main__":
+    job = DailyScraperJob()
+    job.run()
+```
+## 4. Create Scheduler Script
+Create `src/scheduler.py`:
+``` python
+import logging
+import schedule
+import time
+from datetime import datetime
+import json
+import os
+from src.jobs.daily_scraper_job import DailyScraperJob
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Setup logging
+handler = logging.StreamHandler()
+handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+
+class JobScheduler:
+    """Manage daily scheduled scraping jobs"""
+    
+    def __init__(self, config_file: str = "scheduler_config.json"):
+        self.config = self._load_config(config_file)
+        self.schedule_time = self.config.get("schedule_time", "09:00")
+        self.keywords = self.config.get("keywords", [])
+    
+    def _load_config(self, config_file: str) -> dict:
+        """Load scheduler configuration from JSON file"""
+        if os.path.exists(config_file):
+            with open(config_file, 'r') as f:
+                return json.load(f)
+        
+        logger.warning(f"Config file {config_file} not found, using defaults")
+        return {
+            "schedule_time": "09:00",
+            "keywords": ["python developer", "data engineer", "machine learning engineer"],
+            "db_enabled": True
+        }
+    
+    def daily_job(self):
+        """Execute the daily scraping job"""
+        logger.info(f"Executing scheduled job at {datetime.now()}")
+        try:
+            job = DailyScraperJob(
+                db_enabled=self.config.get("db_enabled", True),
+                keywords=self.keywords
+            )
+            job.run()
+        except Exception as e:
+            logger.error(f"Scheduled job failed: {e}", exc_info=True)
+    
+    def start(self):
+        """Start the scheduler"""
+        logger.info(f"Scheduler started. Jobs will run daily at {self.schedule_time}")
+        logger.info(f"Monitoring keywords: {self.keywords}")
+        
+        schedule.every().day.at(self.schedule_time).do(self.daily_job)
+        
+        # Keep scheduler running
+        while True:
+            schedule.run_pending()
+            time.sleep(60)  # Check every minute
+
+
+if __name__ == "__main__":
+    scheduler = JobScheduler()
+    scheduler.start()
+```
+## 5. Create Configuration File
+Create `scheduler_config.json`:
+``` json
+{
+  "schedule_time": "09:00",
+  "keywords": [
+    "python developer",
+    "data engineer",
+    "machine learning engineer",
+    "backend engineer"
+  ],
+  "db_enabled": true
+}
+```
+## 6. Update Requirements
+Add to your `requirements.txt`:
+``` 
+schedule==1.2.0
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+```
+## 7. Create Docker Compose Override for Scheduler
+Create `docker/compose.scheduler.yml`:
+``` yaml
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: jobanalyzer-postgres
+    environment:
+      POSTGRES_USER: <your_db_user>
+      POSTGRES_PASSWORD: <your_db_password>
+      POSTGRES_DB: jobanalyzer
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U <your_db_user>"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  scheduler:
+    build: .
+    container_name: jobanalyzer-scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_USER: <your_db_user>
+      DB_PASSWORD: <your_db_password>
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: jobanalyzer
+    volumes:
+      - ./data:/app/data
+      - ./scheduler_config.json:/app/scheduler_config.json
+    command: python -m src.scheduler
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_data:
+```
+## 8. Usage Instructions
+**Start everything:**
+``` bash
+docker-compose -f docker/compose.scheduler.yml up -d
+```
+**View scheduler logs:**
+``` bash
+docker logs -f jobanalyzer-scheduler
+```
+**Update keywords:** Edit `scheduler_config.json` and restart the scheduler:
+``` bash
+docker-compose -f docker/compose.scheduler.yml restart scheduler
+```
+**Stop everything:**
+``` bash
+docker-compose -f docker/compose.scheduler.yml down
+```
+This setup provides:
+- ✅ Docker-based PostgreSQL integration
+- ✅ Daily scheduling at specified times
+- ✅ Configurable keywords via JSON
+- ✅ Automatic database initialization
+- ✅ Proper logging and error handling
+
+
+## Me
+Can I somehow search for old openings? Like how long they are on LinkedIn?
+Can I add Freelance.nl to my search?
+
+## AI Assistant
+Great questions! Let me address both:
+## 1. Tracking Old Job Openings (Time on LinkedIn)
+To track how long jobs have been posted, we need to:
+**Update your database schema** in `src/database.py`:
+``` python
+def init_db():
+    """Initialize database connection and create tables if needed"""
+    connection_string = get_db_connection_string()
+    engine = create_engine(connection_string, echo=False)
+    
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE SCHEMA IF NOT EXISTS raw;
+            CREATE SCHEMA IF NOT EXISTS staging;
+            CREATE SCHEMA IF NOT EXISTS warehouse;
+        """))
+        
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS raw.job_listings (
+                id SERIAL PRIMARY KEY,
+                external_id VARCHAR(255) UNIQUE,
+                title VARCHAR(255),
+                company VARCHAR(255),
+                location VARCHAR(255),
+                url TEXT,
+                description TEXT,
+                job_board VARCHAR(50),
+                scrape_keyword VARCHAR(100),
+                posted_at TIMESTAMP,
+                hours_old INTEGER,
+                first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status VARCHAR(50) DEFAULT 'active',
+                scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_job_listings_external_id 
+                ON raw.job_listings(external_id);
+            CREATE INDEX IF NOT EXISTS idx_job_listings_hours_old 
+                ON raw.job_listings(hours_old);
+            CREATE INDEX IF NOT EXISTS idx_job_listings_first_seen_at 
+                ON raw.job_listings(first_seen_at);
+            CREATE INDEX IF NOT EXISTS idx_job_listings_status 
+                ON raw.job_listings(status);
+        """))
+        
+        conn.commit()
+```
+**Create a job history tracker** in `src/jobs/job_history_tracker.py`:
+``` python
+import logging
+from datetime import datetime, timedelta
+from sqlalchemy import text
+from src.database import get_session
+
+logger = logging.getLogger(__name__)
+
+
+class JobHistoryTracker:
+    """Track job posting history and duration"""
+    
+    @staticmethod
+    def update_job_status(external_id: str, job_data: dict):
+        """
+        Update or insert job record, tracking first/last seen dates
+        """
+        with get_session() as session:
+            # Check if job already exists
+            existing = session.execute(
+                text("SELECT id, last_seen_at FROM raw.job_listings WHERE external_id = :id"),
+                {"id": external_id}
+            ).fetchone()
+            
+            if existing:
+                # Update last_seen_at and calculate days old
+                days_old = (datetime.utcnow() - job_data.get('posted_at', datetime.utcnow())).days
+                session.execute(
+                    text("""
+                        UPDATE raw.job_listings 
+                        SET last_seen_at = CURRENT_TIMESTAMP,
+                            hours_old = :hours_old,
+                            status = 'active'
+                        WHERE external_id = :id
+                    """),
+                    {"id": external_id, "hours_old": days_old * 24}
+                )
+            else:
+                # New job, insert it
+                session.execute(
+                    text("""
+                        INSERT INTO raw.job_listings 
+                        (external_id, title, company, location, url, description, 
+                         job_board, scrape_keyword, posted_at, hours_old, status)
+                        VALUES (:external_id, :title, :company, :location, :url, :description,
+                                :job_board, :keyword, :posted_at, :hours_old, 'active')
+                    """),
+                    {
+                        'external_id': external_id,
+                        'title': job_data.get('title'),
+                        'company': job_data.get('company'),
+                        'location': job_data.get('location'),
+                        'url': job_data.get('url'),
+                        'description': job_data.get('description'),
+                        'job_board': job_data.get('job_board', 'unknown'),
+                        'keyword': job_data.get('search_term'),
+                        'posted_at': job_data.get('posted_at', datetime.utcnow()),
+                        'hours_old': job_data.get('hours_old', 0)
+                    }
+                )
+            
+            session.commit()
+    
+    @staticmethod
+    def mark_stale_jobs():
+        """Mark jobs as inactive if not seen in last 7 days"""
+        with get_session() as session:
+            session.execute(text("""
+                UPDATE raw.job_listings 
+                SET status = 'inactive'
+                WHERE status = 'active' 
+                AND last_seen_at < CURRENT_TIMESTAMP - INTERVAL '7 days'
+            """))
+            session.commit()
+    
+    @staticmethod
+    def get_job_duration_stats(days: int = 7):
+        """Get statistics on how long jobs stay posted"""
+        with get_session() as session:
+            result = session.execute(text("""
+                SELECT 
+                    company,
+                    COUNT(*) as total_jobs,
+                    AVG(EXTRACT(DAY FROM (last_seen_at - first_seen_at))) as avg_days_posted,
+                    MIN(first_seen_at) as earliest_posting,
+                    MAX(last_seen_at) as latest_seen
+                FROM raw.job_listings
+                WHERE first_seen_at > CURRENT_TIMESTAMP - INTERVAL ':days days'
+                GROUP BY company
+                ORDER BY avg_days_posted DESC
+            """), {"days": days}).fetchall()
+            
+            return result
+```
+## 2. Add Freelance.nl Support
+First, check if supports Freelance.nl:Based on my research, I have some important information for you: `jobspy`
+## 1. Searching for Old Job Openings (Duration on LinkedIn)
+The `hours_old=720` parameter in your current scraper already searches for jobs posted in the last 30 days. To track **how long** jobs stay on LinkedIn, you need to implement a **historical tracking system**:
+### Track Job Posting Duration
+Create `src/jobs/job_tracker.py`:
+``` python
+import logging
+from datetime import datetime, timedelta
+from sqlalchemy import text
+from src.database import get_session
+
+logger = logging.getLogger(__name__)
+
+
+class JobTracker:
+    """Track job posting duration and lifecycle"""
+    
+    @staticmethod
+    def track_job_posting(job_data: dict):
+        """
+        Track when a job was first seen vs when we see it again.
+        Calculate how long it's been posted.
+        """
+        with get_session() as session:
+            # Check if job already exists
+            check_sql = text("""
+                SELECT id, first_seen_at FROM raw.job_listings 
+                WHERE url = :url
+            """)
+            
+            result = session.execute(check_sql, {'url': job_data.get('url')}).fetchone()
+            
+            if result:
+                # Job already in DB - it's still active
+                first_seen = result[1]
+                days_posted = (datetime.utcnow() - first_seen).days
+                logger.info(f"Job still active: {job_data.get('title')} ({days_posted} days posted)")
+                return days_posted
+            else:
+                # New job - record it
+                insert_sql = text("""
+                    INSERT INTO raw.job_listings 
+                    (title, company, location, url, description, job_board, scrape_keyword, first_seen_at)
+                    VALUES (:title, :company, :location, :url, :description, :job_board, :keyword, :first_seen)
+                """)
+                
+                session.execute(insert_sql, {
+                    'title': job_data.get('title'),
+                    'company': job_data.get('company'),
+                    'location': job_data.get('location'),
+                    'url': job_data.get('url'),
+                    'description': job_data.get('description'),
+                    'job_board': job_data.get('job_board'),
+                    'keyword': job_data.get('search_term'),
+                    'first_seen': datetime.utcnow()
+                })
+                session.commit()
+                logger.info(f"New job tracked: {job_data.get('title')}")
+                return 0
+    
+    @staticmethod
+    def get_long_posted_jobs(days_threshold: int = 30):
+        """Get jobs that have been posted for over X days"""
+        with get_session() as session:
+            sql = text("""
+                SELECT title, company, location, url, 
+                       (CURRENT_TIMESTAMP - first_seen_at) as days_posted
+                FROM raw.job_listings
+                WHERE first_seen_at < CURRENT_TIMESTAMP - INTERVAL '1 day' * :days
+                AND last_seen_at IS NULL
+                ORDER BY days_posted DESC
+            """)
+            
+            results = session.execute(sql, {'days': days_threshold}).fetchall()
+            return results
+```
+### Update Your Database Schema
+Add these columns to track job posting duration:
+``` sql
+ALTER TABLE raw.job_listings ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP;
+ALTER TABLE raw.job_listings ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP;
+ALTER TABLE raw.job_listings ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;
+```
+## 2. Adding Freelance.nl Support
+Unfortunately, **JobSpy (the library you're using) does not currently support Freelance.nl** [[2]](https://github.com/speedyapply/JobSpy). The library only supports: LinkedIn, Indeed, Glassdoor, Google, ZipRecruiter, and a few others.
+However, you have **two options**:
+### **Option A: Create a Custom Freelance.nl Scraper** (Recommended)
+Create `src/scrapers/freelancenl_scraper.py`:
+``` python
+import logging
+import requests
+from bs4 import BeautifulSoup
+from typing import List, Dict, Any
+from .base_scraper import BaseScraper
+
+logger = logging.getLogger(__name__)
+
+
+class FreelanceNlScraper(BaseScraper):
+    """Scraper for Freelance.nl Dutch job platform"""
+
+    def __init__(self, rate_limit_config: Dict[str, Any]):
+        super().__init__("freelance.nl", rate_limit_config)
+        self.base_url = "https://www.freelance.nl/projects"
+
+    def scrape(self, keyword: str, location: str = None) -> List[Dict[str, Any]]:
+        """
+        Scrape Freelance.nl using web scraping
+        Returns job listings
+        """
+        try:
+            # Build search URL
+            params = {
+                'search': keyword,
+                'page': 1
+            }
+            
+            jobs = []
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            response = requests.get(self.base_url, params=params, headers=headers, timeout=10)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Parse job listings (adjust selectors based on actual HTML structure)
+            job_elements = soup.find_all('div', class_='project-item')
+            
+            for job_elem in job_elements:
+                try:
+                    job = {
+                        'title': job_elem.find('h2', class_='project-title').text.strip(),
+                        'company': 'Freelance.nl Project',
+                        'location': location or 'Netherlands',
+                        'url': job_elem.find('a')['href'],
+                        'description': job_elem.find('p', class_='project-description').text.strip(),
+                        'job_board': 'freelance.nl',
+                        'search_term': keyword,
+                        'budget': job_elem.find('span', class_='budget')
+                    }
+                    jobs.append(job)
+                except Exception as e:
+                    logger.warning(f"Error parsing job element: {e}")
+                    continue
+            
+            logger.info(f"Scraped {len(jobs)} jobs from Freelance.nl for '{keyword}'")
+            return jobs
+
+        except Exception as e:
+            logger.error(f"Freelance.nl scrape failed for '{keyword}': {e}")
+            raise
+```
+### **Option B: Use a Third-Party Freelance.nl Scraper API** [[1]](https://apify.com/unfenced-group/freelancer-nl-scraper)
+Alternatively, you could use Apify's Freelance.nl scraper service.
+### **Integrate Freelance.nl into Your Daily Job**
+Update `src/jobs/daily_scraper_job.py`:
+``` python
+from src.scrapers import LinkedInScraper, FreelanceNlScraper, ScraperConfig, JobBoard
+
+def run(self):
+    """Execute daily scraping job"""
+    logger.info("=" * 60)
+    logger.info(f"Starting daily scraping job: {self.run_timestamp}")
+    logger.info("=" * 60)
+    
+    all_jobs = []
+    
+    # LinkedIn
+    try:
+        logger.info("\n[1/2] Scraping LinkedIn...")
+        linkedin = LinkedInScraper(self.config.RATE_LIMITS[JobBoard.LINKEDIN.value])
+        linkedin_jobs = linkedin.scrape_batch(self.keywords, self.config.LOCATION)
+        all_jobs.extend(linkedin_jobs)
+        logger.info(f"✓ LinkedIn: {len(linkedin_jobs)} jobs")
+    except Exception as e:
+        logger.error(f"✗ LinkedIn scraping failed: {e}")
+    
+    # Freelance.nl
+    try:
+        logger.info("\n[2/2] Scraping Freelance.nl...")
+        freelancenl = FreelanceNlScraper(self.config.RATE_LIMITS.get("freelance.nl", {}))
+        freelancenl_jobs = freelancenl.scrape_batch(self.keywords, self.config.LOCATION)
+        all_jobs.extend(freelancenl_jobs)
+        logger.info(f"✓ Freelance.nl: {len(freelancenl_jobs)} jobs")
+    except Exception as e:
+        logger.error(f"✗ Freelance.nl scraping failed: {e}")
+    
+    # Rest of your code...
+```
+## Summary
+
+| Feature | Implementation |
+| --- | --- |
+| **Track job duration** | Use `first_seen_at` column + historical comparison |
+| **Find old openings** | Query jobs posted 30+ days ago |
+| **Add Freelance.nl** | Create custom scraper (Option A) or use API service (Option B) |
+Would you like me to help you implement the custom Freelance.nl scraper with proper HTML parsing for their actual site structure?
+
+
+## Me
+
+Digest: sha256:1b92e7a80c021647bf70f5d3eb66066a998e4f5cf43c07bb9dc9f729782cf88e
+Status: Downloaded newer image for postgres:15
+Building scheduler
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+unable to prepare context: unable to evaluate symlinks in Dockerfile path: lstat /opt/ujops/docker/Dockerfile: no such file or directory
+ERROR: Service 'scheduler' failed to build : Build failed
+
+
+## AI Assistant
+The issue is that you're building from the `docker/` directory, but the Dockerfile path is incorrect. Let me help you fix this:The issue is that your `docker/compose.scheduler.yml` is trying to build a Dockerfile from the `docker/` directory, but it doesn't exist there. You need to either:
+1. **Copy the Dockerfile to the docker directory**, or
+2. **Update the compose file to reference the root Dockerfile**
+
+I recommend **Option 2** since you already have a Dockerfile in the root. Here's the fix:
+Create/update `docker/compose.scheduler.yml`:
+``` yaml
 version: '3.8'
 
 services:
@@ -44,3 +805,260 @@ services:
 
 volumes:
   postgres_data:
+```
+**Key changes:**
+- `build.context: ..` → Points to parent directory (project root)
+- `build.dockerfile: Dockerfile` → Uses your existing Dockerfile
+- `volumes` paths adjusted to use `../` for parent directory references
+
+Also, **update your Dockerfile** to handle the scheduler command:
+``` dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY . /app
+
+# Install dependencies including the scheduler
+RUN pip install --no-cache-dir -r requirements.txt
+
+ENV PORT=8001
+
+EXPOSE 8001
+
+# Default to API, but allow override via command
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8001"]
+```
+Make sure your includes the scheduler dependencies: `requirements.txt`
+``` 
+fastapi
+uvicorn
+requests
+pydantic
+python-dotenv
+schedule==1.2.0
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+```
+Then run:
+``` bash
+docker-compose -f docker/compose.scheduler.yml up -d
+```
+This should resolve the build error! Let me know if you hit any other issues.
+
+
+## Me
+Successfully tagged docker_scheduler:latest
+WARNING: Image for service scheduler was built because it did not already exist. To rebuild this image you must use `docker-compose build` or `docker-compose up --build`.
+Creating jobanalyzer-postgres ... done
+
+ERROR: for scheduler  Container "d41b5477809a" is unhealthy.
+ERROR: Encountered errors while bringing up the project.
+
+
+## AI Assistant
+The issue is that the **scheduler container is starting before PostgreSQL is fully ready**. Even though we have a health check, the scheduler immediately tries to connect to the database and crashes.
+Let's fix this with an improved compose file and a connection retry mechanism:
+**Update `docker/compose.scheduler.yml`:**
+``` yaml
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: jobanalyzer-postgres
+    environment:
+      POSTGRES_USER: jobanalyzer_user
+      POSTGRES_PASSWORD: <your_secure_password>
+      POSTGRES_DB: jobanalyzer
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobanalyzer_user -d jobanalyzer"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - jobanalyzer-net
+
+  scheduler:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: jobanalyzer-scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_USER: jobanalyzer_user
+      DB_PASSWORD: <your_secure_password>
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: jobanalyzer
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ../data:/app/data
+      - ../scheduler_config.json:/app/scheduler_config.json:ro
+    command: >
+      sh -c "
+        echo 'Waiting for database...' &&
+        python -c 'import time; time.sleep(5)' &&
+        python -m src.scheduler
+      "
+    restart: on-failure
+    networks:
+      - jobanalyzer-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_data:
+
+networks:
+  jobanalyzer-net:
+    driver: bridge
+```
+**Update `src/database.py`** to handle connection retries:
+``` python
+import os
+import logging
+import time
+from sqlalchemy import create_engine, text, event
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
+from contextlib import contextmanager
+
+logger = logging.getLogger(__name__)
+
+
+def get_db_connection_string():
+    """Get PostgreSQL connection string from environment or defaults"""
+    db_user = os.getenv("DB_USER", "jobanalyzer_user")
+    db_password = os.getenv("DB_PASSWORD", "jobanalyzer_pass")
+    db_host = os.getenv("DB_HOST", "localhost")
+    db_port = os.getenv("DB_PORT", "5432")
+    db_name = os.getenv("DB_NAME", "jobanalyzer")
+    
+    return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
+
+def init_db(max_retries: int = 5):
+    """Initialize database connection with retry logic"""
+    connection_string = get_db_connection_string()
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to PostgreSQL (attempt {attempt + 1}/{max_retries})...")
+            
+            engine = create_engine(
+                connection_string,
+                poolclass=QueuePool,
+                pool_size=5,
+                max_overflow=10,
+                pool_pre_ping=True,
+                echo=False,
+                connect_args={'connect_timeout': 5}
+            )
+            
+            # Test connection
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            
+            logger.info("✓ Connected to PostgreSQL successfully")
+            
+            # Create schemas and tables
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    CREATE SCHEMA IF NOT EXISTS raw;
+                    CREATE SCHEMA IF NOT EXISTS staging;
+                    CREATE SCHEMA IF NOT EXISTS warehouse;
+                """))
+                
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS raw.job_listings (
+                        id SERIAL PRIMARY KEY,
+                        title VARCHAR(255),
+                        company VARCHAR(255),
+                        location VARCHAR(255),
+                        url TEXT UNIQUE,
+                        description TEXT,
+                        job_board VARCHAR(50),
+                        scrape_keyword VARCHAR(100),
+                        first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_seen_at TIMESTAMP,
+                        is_active BOOLEAN DEFAULT true,
+                        scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    
+                    CREATE INDEX IF NOT EXISTS idx_job_listings_url 
+                        ON raw.job_listings(url);
+                    CREATE INDEX IF NOT EXISTS idx_job_listings_first_seen_at 
+                        ON raw.job_listings(first_seen_at);
+                    CREATE INDEX IF NOT EXISTS idx_job_listings_job_board 
+                        ON raw.job_listings(job_board);
+                    CREATE INDEX IF NOT EXISTS idx_job_listings_active 
+                        ON raw.job_listings(is_active);
+                """))
+                
+                conn.commit()
+            
+            logger.info("Database tables initialized successfully")
+            return engine
+            
+        except Exception as e:
+            logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                wait_time = 5 * (attempt + 1)
+                logger.info(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"Failed to connect to database after {max_retries} attempts")
+                raise
+
+
+@contextmanager
+def get_session():
+    """Context manager for database sessions"""
+    try:
+        engine = create_engine(get_db_connection_string(), pool_pre_ping=True)
+        Session = sessionmaker(bind=engine)
+        session = Session()
+        yield session
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Database session error: {e}")
+        raise
+    finally:
+        session.close()
+```
+**Update `src/scheduler.py`** to handle startup better:
+``` python
+import logging
+import schedule
+import time
+from datetime import datetime
+import json
+import os
+import sys
+from src.jobs.daily_scraper_job import DailyScraperJob
+from src.database import init_db
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Setup logging
+handler = logging.StreamHandler()
+handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger
+```
+

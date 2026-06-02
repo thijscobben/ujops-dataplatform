@@ -4,7 +4,9 @@ import time
 from datetime import datetime
 import json
 import os
+import sys
 from src.jobs.daily_scraper_job import DailyScraperJob
+from src.database import init_db
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -21,9 +23,19 @@ class JobScheduler:
     """Manage daily scheduled scraping jobs"""
 
     def __init__(self, config_file: str = "scheduler_config.json"):
+        logger.info("Initializing scheduler...")
+
+        # Wait for database
+        try:
+            init_db(max_retries=10)
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+            sys.exit(1)
+
         self.config = self._load_config(config_file)
         self.schedule_time = self.config.get("schedule_time", "09:00")
         self.keywords = self.config.get("keywords", [])
+        logger.info(f"Scheduler initialized with {len(self.keywords)} keywords")
 
     def _load_config(self, config_file: str) -> dict:
         """Load scheduler configuration from JSON file"""
@@ -34,7 +46,7 @@ class JobScheduler:
         logger.warning(f"Config file {config_file} not found, using defaults")
         return {
             "schedule_time": "09:00",
-            "keywords": ["python developer", "data engineer", "machine learning engineer"],
+            "keywords": ["python developer", "data engineer"],
             "db_enabled": True
         }
 
@@ -64,5 +76,12 @@ class JobScheduler:
 
 
 if __name__ == "__main__":
-    scheduler = JobScheduler()
-    scheduler.start()
+    try:
+        scheduler = JobScheduler()
+        scheduler.start()
+    except KeyboardInterrupt:
+        logger.info("Scheduler stopped by user")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
