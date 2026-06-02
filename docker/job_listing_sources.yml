@@ -1,0 +1,34 @@
+# dbt/sources.yml
+version: 2
+
+sources:
+  - name: raw
+    description: "Raw job listing data from various sources"
+    tables:
+      - name: job_listings
+        description: "Raw scraped job postings"
+        columns:
+          - name: source
+            description: "Job board source (linkedin, indeed, upwork, etc.)"
+            tests:
+              - not_null
+              - accepted_values:
+                  values: ['linkedin', 'indeed', 'upwork', 'toptal', 'freelancer.com']
+          
+          - name: source_job_id
+            description: "Unique ID from source"
+            tests:
+              - not_null
+          
+          - name: title
+          - name: company
+          - name: location
+          - name: job_url
+            tests:
+              - unique
+              - not_null
+          
+          - name: date_posted
+          - name: date_scraped
+            tests:
+              - not_null
