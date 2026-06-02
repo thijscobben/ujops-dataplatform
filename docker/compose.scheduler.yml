@@ -5,8 +5,8 @@ services:
     image: postgres:15
     container_name: jobanalyzer-postgres
     environment:
-      POSTGRES_USER: ujops
-      POSTGRES_PASSWORD: fulfil123
+      POSTGRES_USER: <your_db_user>
+      POSTGRES_PASSWORD: <your_db_password>
       POSTGRES_DB: jobanalyzer
     ports:
       - "5432:5432"
@@ -19,20 +19,22 @@ services:
       retries: 5
 
   scheduler:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: jobanalyzer-scheduler
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      DB_USER: ujops
-      DB_PASSWORD: fulfil123
+      DB_USER: <your_db_user>
+      DB_PASSWORD: <your_db_password>
       DB_HOST: postgres
       DB_PORT: 5432
       DB_NAME: jobanalyzer
     volumes:
-      - ./data:/app/data
-      - ./scheduler_config.json:/app/scheduler_config.json
+      - ../data:/app/data
+      - ../scheduler_config.json:/app/scheduler_config.json
     command: python -m src.scheduler
     logging:
       driver: "json-file"
