@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: jobanalyzer-postgres
+    environment:
+      POSTGRES_USER: ujops
+      POSTGRES_PASSWORD: fulfil123
+      POSTGRES_DB: jobanalyzer
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U <your_db_user>"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  scheduler:
+    build: .
+    container_name: jobanalyzer-scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_USER: ujops
+      DB_PASSWORD: fulfil123
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: jobanalyzer
+    volumes:
+      - ./data:/app/data
+      - ./scheduler_config.json:/app/scheduler_config.json
+    command: python -m src.scheduler
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_data:

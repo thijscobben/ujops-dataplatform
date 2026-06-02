@@ -2,19 +2,18 @@ version: '3.8'
 
 services:
   postgres:
-    image: postgres:15-alpine
-    container_name: postgres-container
+    image: postgres:15
+    container_name: jobanalyzer-postgres
     environment:
-      POSTGRES_USER: <your_username>
-      POSTGRES_PASSWORD: <your_password>
-      POSTGRES_DB: <your_database_name>
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./init-scripts:/docker-entrypoint-initdb.d
+      POSTGRES_USER: ujops
+      POSTGRES_PASSWORD: unful123
+      POSTGRES_DB: jobanalyzer
     ports:
       - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U <your_username>"]
+      test: ["CMD-SHELL", "pg_isready -U <your_db_user>"]
       interval: 10s
       timeout: 5s
       retries: 5
