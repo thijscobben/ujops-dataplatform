@@ -5,13 +5,14 @@ services:
     image: postgres:15
     container_name: jobanalyzer-postgres
     environment:
-      POSTGRES_USER: jobanalyzer_user
-      POSTGRES_PASSWORD: <your_secure_password>
+      POSTGRES_USER: ujops
+      POSTGRES_PASSWORD: change
       POSTGRES_DB: jobanalyzer
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U jobanalyzer_user -d jobanalyzer"]
       interval: 5s
@@ -30,8 +31,8 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DB_USER: jobanalyzer_user
-      DB_PASSWORD: <your_secure_password>
+      DB_USER: ujops
+      DB_PASSWORD: change
       DB_HOST: postgres
       DB_PORT: 5432
       DB_NAME: jobanalyzer
