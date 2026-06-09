@@ -24,4 +24,4 @@ CREATE SCHEMA IF NOT EXISTS warehouse;
 -- Grant schema permissions
 GRANT USAGE, CREATE ON SCHEMA raw TO ujops;
 GRANT USAGE, CREATE ON SCHEMA staging TO ujops;
-GRANT USAGE, CREATE ON SCHEMA warehouse TO ujops; SCHEMA warehouse TO ujops;
+GRANT USAGE, CREATE ON SCHEMA warehouse TO ujops;
