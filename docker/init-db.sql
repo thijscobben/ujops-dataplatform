@@ -1,19 +1,4 @@
--- Initialize database with required roles and permissions
-CREATE ROLE ujops WITH LOGIN CREATEDB;
-ALTER ROLE ujops WITH PASSWORD 'change';
 
--- Grant permissions to jobanalyzer_user
-GRANT ALL PRIVILEGES ON DATABASE jobanalyzer TO jobanalyzer_user;
-
--- Create schemas
-CREATE SCHEMA IF NOT EXISTS raw;
-CREATE SCHEMA IF NOT EXISTS staging;
-CREATE SCHEMA IF NOT EXISTS warehouse;
-
--- Grant schema permissions
-GRANT USAGE, CREATE ON SCHEMA raw TO jobanalyzer_user;
-GRANT USAGE, CREATE ON SCHEMA staging TO jobanalyzer_user;
-GRANT USAGE, CREATE ON
 -- Initialize database with required roles and permissions
 -- Use IF NOT EXISTS pattern to avoid errors on re-initialization
 
@@ -29,7 +14,7 @@ END
 $$;
 
 -- Grant permissions to jobanalyzer_user
-GRANT ALL PRIVILEGES ON DATABASE jobanalyzer TO jobanalyzer_user;
+GRANT ALL PRIVILEGES ON DATABASE jobanalyzer TO ujops;
 
 -- Create schemas (IF NOT EXISTS already handles duplicates)
 CREATE SCHEMA IF NOT EXISTS raw;
@@ -37,6 +22,6 @@ CREATE SCHEMA IF NOT EXISTS staging;
 CREATE SCHEMA IF NOT EXISTS warehouse;
 
 -- Grant schema permissions
-GRANT USAGE, CREATE ON SCHEMA raw TO jobanalyzer_user;
-GRANT USAGE, CREATE ON SCHEMA staging TO jobanalyzer_user;
-GRANT USAGE, CREATE ON SCHEMA warehouse TO jobanalyzer_user; SCHEMA warehouse TO jobanalyzer_user;
+GRANT USAGE, CREATE ON SCHEMA raw TO ujops;
+GRANT USAGE, CREATE ON SCHEMA staging TO ujops;
+GRANT USAGE, CREATE ON SCHEMA warehouse TO ujops; SCHEMA warehouse TO ujops;
